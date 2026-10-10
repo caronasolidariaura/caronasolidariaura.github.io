@@ -342,11 +342,63 @@ function cor(id) {
   let h = 0; for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) % 360;
   return `hsl(${h} 42% 42%)`;
 }
+/* fotos: a atualização traz só a etiqueta (fotoV); cada foto é baixada uma vez, em lote, e fica guardada no aparelho */
+const CHAVE_FOTOS = 'caronas_fotos';
+const FOTOS = (() => { try { return JSON.parse(localStorage.getItem(CHAVE_FOTOS) || '{}') || {}; } catch (e) { return {}; } })();
+const fotosFaltando = new Set(), fotosNoCaminho = new Set();
+const versaoFoto = f => (f ? f.length + '-' + f.slice(-12).replace(/[^A-Za-z0-9]/g, '') : '');
+function fotoDe(p) {
+  if (p.foto && String(p.foto).indexOf('data:image') === 0) return p.foto;
+  if (!p.fotoV) return '';
+  const f = FOTOS[p.id];
+  if (f && f.v === p.fotoV) return f.url;
+  if (!fotosNoCaminho.has(p.id)) {
+    fotosFaltando.add(p.id);
+    if (!fotoDe.t) fotoDe.t = setTimeout(buscaFotos, 30);
+  }
+  return '';
+}
+async function buscaFotos() {
+  fotoDe.t = null;
+  if (!S.token || !S.d || !S.d.pessoas) return;
+  const ids = [...fotosFaltando].filter(id => { const f = FOTOS[id]; return !(f && f.v === pessoa(id).fotoV); }).slice(0, 60);
+  fotosFaltando.clear();
+  if (!ids.length) return;
+  ids.forEach(id => fotosNoCaminho.add(id));
+  try {
+    const r = await chamar('fotos', S.token, ids);
+    Object.keys(r || {}).forEach(id => { FOTOS[id] = r[id]; trocaFoto(id); });
+    guardaFotos();
+  } catch (e) { /* sem internet: tenta de novo na próxima atualização */ }
+  ids.forEach(id => fotosNoCaminho.delete(id));
+}
+/* põe a foto no lugar das iniciais sem redesenhar a tela (funciona também com um formulário aberto) */
+function trocaFoto(id) {
+  document.querySelectorAll(`[data-foto="${id}"]`).forEach(el => {
+    el.outerHTML = `<img class="${el.className}" src="${esc(FOTOS[id].url)}" alt="">`;
+  });
+}
+function guardaFotos() {
+  const ids = new Set(((S.d && S.d.pessoas) || []).map(p => p.id));
+  Object.keys(FOTOS).forEach(id => { if (ids.size && !ids.has(id)) delete FOTOS[id]; });
+  try { localStorage.setItem(CHAVE_FOTOS, JSON.stringify(FOTOS)); }
+  catch (e) { try { localStorage.removeItem(CHAVE_FOTOS); } catch (e2) {} }
+}
+/* a foto que eu mesmo enviei já fica guardada, sem baixar de volta */
+function guardaMinhaFoto(url) {
+  if (!S.eu || !url) return;
+  FOTOS[S.eu.id] = { v: versaoFoto(url), url: url };
+  guardaFotos();
+  trocaFoto(S.eu.id);
+}
+
 function avatar(p, tam) {
   const cls = 'av' + (tam ? ' ' + tam : '');
-  if (p.foto && String(p.foto).indexOf('data:image') === 0) return `<img class="${cls}" src="${esc(p.foto)}" alt="">`;
+  const url = fotoDe(p);
+  if (url) return `<img class="${cls}" src="${esc(url)}" alt="">`;
   const ini = String(p.nome || '?').trim().split(/\s+/).slice(0, 2).map(x => x[0]).join('').toUpperCase();
-  return `<span class="${cls}" style="background:${cor(p.id)}" aria-hidden="true">${esc(ini)}</span>`;
+  const espera = p.fotoV ? ` data-foto="${esc(p.id)}"` : '';
+  return `<span class="${cls}" style="background:${cor(p.id)}"${espera} aria-hidden="true">${esc(ini)}</span>`;
 }
 function dia(iso, longo) {
   if (!iso) return '';
@@ -712,7 +764,9 @@ function renderEntrada(etapa, tel, extra) {
       ev.preventDefault();
       const f = ev.target;
       if (!confere(f)) return;
-      aoEntrar(await acao('cadastrar', { nome: f.nome.value, telefone: f.telefone.value, email: f.email.value, senha: f.senha.value, foto: fotoTemp, descricao: f.descricao.value }, null, f.querySelector('button[type=submit]')), 'Bem-vindo(a)');
+      const minhaFoto = fotoTemp;
+      aoEntrar(await acao('cadastrar', { nome: f.nome.value, telefone: f.telefone.value, email: f.email.value, senha: f.senha.value, foto: minhaFoto, descricao: f.descricao.value }, null, f.querySelector('button[type=submit]')), 'Bem-vindo(a)');
+      guardaMinhaFoto(minhaFoto);
     };
     return;
   }
@@ -1007,7 +1061,7 @@ function abrirPerfil() {
       <span id="prevPerfil">${avatar(S.eu, 'g')}</span>
       <div style="display:flex;flex-direction:column;gap:6px">
         <label class="btn" style="cursor:pointer">Trocar foto<input type="file" accept="${IMAGENS}" id="arqPerfil" hidden></label>
-        ${S.eu.foto ? '<button class="btn perigo" type="button" id="tiraFoto">Remover foto</button>' : ''}
+        ${S.eu.fotoV ? '<button class="btn perigo" type="button" id="tiraFoto">Remover foto</button>' : ''}
       </div>
     </div>
     <label class="f"><span>Nome</span><input class="in-txt" name="nome" maxlength="60" value="${esc(S.eu.nome)}" required></label>
@@ -1019,7 +1073,12 @@ function abrirPerfil() {
       <button class="btn" type="button" id="trocaSenha" style="justify-content:center">Trocar senha</button>
       <button class="btn" type="button" id="sairApp" style="justify-content:center">Sair deste aparelho</button>
     </div>`,
-    (f, b) => acao('perfil', { token: S.token, nome: f.nome.value, descricao: f.descricao.value, email: f.email.value, foto: fotoTemp, removerFoto: remover && !fotoTemp }, 'Perfil salvo.', b));
+    async (f, b) => {
+      const nova = fotoTemp;
+      const ok = await acao('perfil', { token: S.token, nome: f.nome.value, descricao: f.descricao.value, email: f.email.value, foto: nova, removerFoto: remover && !nova }, 'Perfil salvo.', b);
+      if (ok && nova) { guardaMinhaFoto(nova); render(); }
+      return ok;
+    });
   ligaFoto('#arqPerfil', '#prevPerfil');
   const tf = $('#tiraFoto');
   if (tf) tf.onclick = () => { remover = true; fotoTemp = ''; $('#prevPerfil').innerHTML = avatar({ id: S.eu.id, nome: S.eu.nome }, 'g'); };
